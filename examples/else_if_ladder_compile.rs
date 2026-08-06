@@ -8,7 +8,10 @@
 //!   --program PATH --env-width 8 --env-depth 4 --warmup 2 --repeat 7
 //! ```
 //!
-//! `--fields` is assigns per synthetic ladder arm.
+//! `--fields` is event-path assigns per synthetic ladder arm; `--locals` adds
+//! local-variable assigns, and `--locals-shared` / `--fields-disjoint` control
+//! whether those names repeat across arms (fixed live set) or are distinct
+//! (live set grows with arm count).
 //! `--env-width` / `--env-depth` / `--env-seed-fields` shape the starting event `Kind`
 //! (incoming schema), independent of the program text.
 
@@ -26,6 +29,110 @@ use vrl::compiler::state::ExternalEnv;
 use vrl::value::Kind;
 use vrl::value::kind::{Collection, Field};
 
+// `find_enrichment_table_records` / `get_enrichment_table_record` are provided by
+// vector's `enrichment` crate, not by `vrl::stdlib::all()`, so `--program` could not
+// time real-world vector remap programs. Register compile-only stubs with the same
+// arity and return kinds. They are fallible so `?? []` / `?? {}` stays well-typed. Only
+// `compile`/`type_def` matter here; `resolve` is never executed by this harness.
+mod enrichment_stubs {
+    use vrl::compiler::prelude::*;
+
+    const STUB_PARAMS: &[Parameter] = &[
+        Parameter::required("table", kind::BYTES, "stub"),
+        Parameter::required("condition", kind::OBJECT, "stub"),
+        Parameter::optional("select", kind::ARRAY, "stub"),
+        Parameter::optional("case_sensitive", kind::BOOLEAN, "stub"),
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct FindEnrichmentTableRecords;
+
+    impl Function for FindEnrichmentTableRecords {
+        fn identifier(&self) -> &'static str {
+            "find_enrichment_table_records"
+        }
+        fn usage(&self) -> &'static str {
+            "stub"
+        }
+        fn category(&self) -> &'static str {
+            "enrichment"
+        }
+        fn return_kind(&self) -> u16 {
+            kind::ARRAY
+        }
+        fn examples(&self) -> &'static [Example] {
+            &[]
+        }
+        fn parameters(&self) -> &'static [Parameter] {
+            STUB_PARAMS
+        }
+        fn compile(
+            &self,
+            _state: &state::TypeState,
+            _ctx: &mut FunctionCompileContext,
+            _args: ArgumentList,
+        ) -> Compiled {
+            Ok(StubArrayFn.as_expr())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubArrayFn;
+
+    impl FunctionExpression for StubArrayFn {
+        fn resolve(&self, _: &mut Context) -> Resolved {
+            Ok(Value::Array(vec![]))
+        }
+        fn type_def(&self, _: &state::TypeState) -> TypeDef {
+            TypeDef::array(Collection::any()).fallible()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct GetEnrichmentTableRecord;
+
+    impl Function for GetEnrichmentTableRecord {
+        fn identifier(&self) -> &'static str {
+            "get_enrichment_table_record"
+        }
+        fn usage(&self) -> &'static str {
+            "stub"
+        }
+        fn category(&self) -> &'static str {
+            "enrichment"
+        }
+        fn return_kind(&self) -> u16 {
+            kind::OBJECT
+        }
+        fn examples(&self) -> &'static [Example] {
+            &[]
+        }
+        fn parameters(&self) -> &'static [Parameter] {
+            STUB_PARAMS
+        }
+        fn compile(
+            &self,
+            _state: &state::TypeState,
+            _ctx: &mut FunctionCompileContext,
+            _args: ArgumentList,
+        ) -> Compiled {
+            Ok(StubObjectFn.as_expr())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubObjectFn;
+
+    impl FunctionExpression for StubObjectFn {
+        fn resolve(&self, _: &mut Context) -> Resolved {
+            Ok(Value::Object(std::collections::BTreeMap::new()))
+        }
+        fn type_def(&self, _: &state::TypeState) -> TypeDef {
+            TypeDef::object(Collection::any()).fallible()
+        }
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "Usage:
@@ -33,7 +140,10 @@ fn usage() -> ! {
   else_if_ladder_compile --program PATH [env opts] [--warmup W] [--repeat R]
 
   --arms             comma-separated else-if arm counts (default: 10,20,40,60,80)
-  --fields           assigns per synthetic ladder arm (default: 40)
+  --fields           event-path assigns per synthetic ladder arm (default: 40)
+  --locals L         local-variable assigns per synthetic ladder arm (default: 0)
+  --locals-shared    reuse the same local names on every arm (fixed live set)
+  --fields-disjoint  give every arm distinct event-field names (event Kind grows)
   --program          time compile of a VRL source file (skips synthetic ladder)
   --env-width W      known siblings per spine level (default: 0 = ExternalEnv::default())
   --env-depth D      spine nesting depth when width > 0 (default: 1)
@@ -61,6 +171,12 @@ fn parse_csv_usize(s: &str) -> Result<Vec<usize>, String> {
 struct Args {
     arms: Vec<usize>,
     fields: usize,
+    /// Local-variable assigns per arm.
+    locals: usize,
+    /// Reuse the same local names on every arm (fixed live set).
+    locals_shared: bool,
+    /// Give every arm distinct event-field names (wide event `Kind`).
+    fields_disjoint: bool,
     warmup: usize,
     repeat: usize,
     program: Option<PathBuf>,
@@ -73,6 +189,9 @@ struct Args {
 fn parse_args() -> Args {
     let mut arms = vec![10, 20, 40, 60, 80];
     let mut fields = 40;
+    let mut locals = 0;
+    let mut locals_shared = false;
+    let mut fields_disjoint = false;
     let mut warmup = 1;
     let mut repeat = 3;
     let mut program = None;
@@ -94,6 +213,12 @@ fn parse_args() -> Args {
                 let v = argv.next().unwrap_or_else(|| usage());
                 fields = v.parse().unwrap_or_else(|_| usage());
             }
+            "--locals" => {
+                let v = argv.next().unwrap_or_else(|| usage());
+                locals = v.parse().unwrap_or_else(|_| usage());
+            }
+            "--locals-shared" => locals_shared = true,
+            "--fields-disjoint" => fields_disjoint = true,
             "--program" => {
                 let v = argv.next().unwrap_or_else(|| usage());
                 program = Some(PathBuf::from(v));
@@ -126,7 +251,7 @@ fn parse_args() -> Args {
         }
     }
 
-    if program.is_none() && (arms.is_empty() || fields == 0) {
+    if program.is_none() && (arms.is_empty() || (fields == 0 && locals == 0)) {
         eprintln!("--arms/--fields must be non-empty, or pass --program");
         usage();
     }
@@ -142,6 +267,9 @@ fn parse_args() -> Args {
     Args {
         arms,
         fields,
+        locals,
+        locals_shared,
+        fields_disjoint,
         warmup,
         repeat,
         program,
@@ -223,8 +351,35 @@ fn env_label(args: &Args) -> String {
 }
 
 /// Nested `if / else if` ladder with the same field set on every arm.
-fn build_ladder(arm_count: usize, fields_per_arm: usize) -> String {
-    let mut out = String::with_capacity(arm_count * (80 + fields_per_arm * 40));
+///
+/// `locals_per_arm` adds local-variable assigns per arm. Names are disjoint per
+/// arm (`l{i}_{j}`, so the live-local set grows with arms) unless `locals_shared`,
+/// in which case every arm writes the same `l{j}` names (writes grow, live set
+/// stays fixed). `fields_disjoint` does the same for event paths, which grows the
+/// event `Kind` instead of the local env.
+fn build_ladder(
+    arm_count: usize,
+    fields_per_arm: usize,
+    locals_per_arm: usize,
+    locals_shared: bool,
+    fields_disjoint: bool,
+) -> String {
+    let field_name = |i: usize, f: usize| {
+        if fields_disjoint {
+            format!("f{i}_{f}")
+        } else {
+            format!("f{f}")
+        }
+    };
+    let local_name = |i: usize, j: usize| {
+        if locals_shared {
+            format!("l{j}")
+        } else {
+            format!("l{i}_{j}")
+        }
+    };
+
+    let mut out = String::with_capacity(arm_count * (80 + (fields_per_arm + locals_per_arm) * 40));
     out.push_str("eid = int!(.eid)\n");
 
     for i in 0..arm_count {
@@ -234,14 +389,23 @@ fn build_ladder(arm_count: usize, fields_per_arm: usize) -> String {
             out.push_str(&format!("}} else if eid == {i} {{\n"));
         }
         for f in 0..fields_per_arm {
-            out.push_str(&format!("  ._itl.f{f} = \"a{i}_f{f}\"\n"));
+            out.push_str(&format!("  ._itl.{} = \"a{i}_f{f}\"\n", field_name(i, f)));
+        }
+        for j in 0..locals_per_arm {
+            out.push_str(&format!("  {} = \"a{i}_l{j}\"\n", local_name(i, j)));
         }
         out.push_str("  ._itl.class = \"NOTABLE\"\n");
         out.push_str(&format!("  ._itl.arm = {i}\n"));
     }
     out.push_str("} else {\n");
     for f in 0..fields_per_arm {
-        out.push_str(&format!("  ._itl.f{f} = \"else_f{f}\"\n"));
+        out.push_str(&format!(
+            "  ._itl.{} = \"else_f{f}\"\n",
+            field_name(arm_count, f)
+        ));
+    }
+    for j in 0..locals_per_arm {
+        out.push_str(&format!("  {} = \"else_l{j}\"\n", local_name(arm_count, j)));
     }
     out.push_str("  ._itl.class = \"CONTEXT\"\n");
     out.push_str("  ._itl.arm = -1\n");
@@ -304,7 +468,10 @@ fn time_src(
 
 fn main() {
     let args = parse_args();
-    let fns = vrl::stdlib::all();
+    let mut fns = vrl::stdlib::all();
+    fns.push(Box::new(enrichment_stubs::FindEnrichmentTableRecords));
+    fns.push(Box::new(enrichment_stubs::GetEnrichmentTableRecord));
+    let fns = fns;
     let external = build_external(&args);
     let env = env_label(&args);
 
@@ -325,8 +492,8 @@ fn main() {
     }
 
     println!(
-        "else-if ladder compile (fields/arm={}, {env}, warmup={}, repeat={})",
-        args.fields, args.warmup, args.repeat
+        "else-if ladder compile (fields/arm={}, locals/arm={} shared={}, {env}, warmup={}, repeat={})",
+        args.fields, args.locals, args.locals_shared, args.warmup, args.repeat
     );
     println!(
         "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}",
@@ -334,7 +501,13 @@ fn main() {
     );
 
     for &n in &args.arms {
-        let src = build_ladder(n, args.fields);
+        let src = build_ladder(
+            n,
+            args.fields,
+            args.locals,
+            args.locals_shared,
+            args.fields_disjoint,
+        );
         let src_bytes = src.len();
 
         for _ in 0..args.warmup {
