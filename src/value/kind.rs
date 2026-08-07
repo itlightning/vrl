@@ -109,6 +109,41 @@ impl std::fmt::Display for Kind {
     }
 }
 
+impl Kind {
+    /// Conservative structural identity test.
+    ///
+    /// Returns `true` only when the two kinds are certainly equal, and cheaply: nested
+    /// collections are compared by `Arc` pointer over their known maps, so the cost is
+    /// bounded by nesting depth rather than by the number of known fields. `false` means
+    /// "not known to be equal", not "different".
+    ///
+    /// This exists because [`PartialEq`] canonicalizes both sides, which allocates and
+    /// walks the whole tree, so it is not usable on the typecheck hot path.
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        fn collection_is_identical<T: Ord + Clone>(
+            this: Option<&Collection<T>>,
+            other: Option<&Collection<T>>,
+        ) -> bool {
+            match (this, other) {
+                (None, None) => true,
+                (Some(lhs), Some(rhs)) => lhs.is_identical(rhs),
+                _ => false,
+            }
+        }
+
+        self.bytes == other.bytes
+            && self.integer == other.integer
+            && self.float == other.float
+            && self.boolean == other.boolean
+            && self.timestamp == other.timestamp
+            && self.regex == other.regex
+            && self.null == other.null
+            && self.undefined == other.undefined
+            && collection_is_identical(self.array.as_deref(), other.array.as_deref())
+            && collection_is_identical(self.object.as_deref(), other.object.as_deref())
+    }
+}
+
 impl PartialEq for Kind {
     fn eq(&self, other: &Self) -> bool {
         let a = self.canonicalize();

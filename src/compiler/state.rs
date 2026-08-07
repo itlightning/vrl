@@ -72,6 +72,17 @@ pub struct TypeState {
 }
 
 impl TypeState {
+    /// Conservative structural identity: `true` only when the two states are certainly
+    /// equal, and cheaply (`Arc` pointer comparisons over the shared maps). `false` means
+    /// "not known to be equal", not "different". See [`crate::value::Kind::is_identical`].
+    ///
+    /// Because merging a state with an equal state is the identity, this is a sound test
+    /// for "this merge would do nothing".
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        self.local.bindings.ptr_eq(&other.local.bindings)
+            && self.external.is_identical(&other.external)
+    }
+
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -168,6 +179,12 @@ impl Default for ExternalEnv {
 }
 
 impl ExternalEnv {
+    /// Conservative structural identity: `true` only when the two envs are certainly equal.
+    /// See [`TypeState::is_identical`].
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        self.target.is_identical(&other.target) && self.metadata.is_identical(&other.metadata)
+    }
+
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -363,6 +380,77 @@ mod tests {
             TypeDef::integer()
         );
         assert!(applied.variable(&Ident::new("scoped")).is_none());
+    }
+
+    fn state(target: Kind) -> TypeState {
+        TypeState {
+            local: env(TypeDef::bytes()),
+            external: ExternalEnv::new_with_kind(target, Kind::object(Collection::any())),
+        }
+    }
+
+    fn nested_target() -> Kind {
+        Kind::object(Collection::from_parts(
+            [
+                ("a".into(), Kind::integer()),
+                (
+                    "b".into(),
+                    Kind::object(Collection::from_parts(
+                        [("inner".into(), Kind::bytes())].into(),
+                        Kind::null(),
+                    )),
+                ),
+            ]
+            .into(),
+            Kind::bytes(),
+        ))
+    }
+
+    /// `is_identical` is one-sided: it may answer `false` for equal states (it is a cheap
+    /// pointer test), but it must never answer `true` for states that are not equal.
+    #[test]
+    fn is_identical_is_conservative() {
+        let this = state(nested_target());
+
+        // A clone shares every map.
+        assert!(this.is_identical(&this.clone()));
+
+        // Equal by value but sharing nothing: allowed to report false, must not report
+        // true incorrectly. Pin the current (false) answer so a future change is noticed.
+        let distinct = state(nested_target());
+        assert!(!this.is_identical(&distinct));
+
+        // Genuinely different in the external kind only.
+        let other_target = state(Kind::object(Collection::from_parts(
+            [("a".into(), Kind::bytes())].into(),
+            Kind::bytes(),
+        )));
+        assert!(!this.is_identical(&other_target));
+
+        // Genuinely different in the local env only.
+        let mut other_local = this.clone();
+        other_local
+            .local
+            .insert_variable(Ident::new("bar"), details(TypeDef::integer(), None));
+        assert!(!this.is_identical(&other_local));
+    }
+
+    /// The property the `Op` fast path relies on: whenever `is_identical` holds, merging
+    /// changes nothing.
+    #[test]
+    fn is_identical_implies_merge_is_identity() {
+        let this = state(nested_target());
+        let shared = this.clone();
+        assert!(this.is_identical(&shared));
+
+        let merged = this.clone().merge(shared);
+
+        assert_eq!(merged.local, this.local);
+        assert_eq!(merged.external.target(), this.external.target());
+        assert_eq!(
+            merged.external.metadata_kind(),
+            this.external.metadata_kind()
+        );
     }
 
     /// `TypeState::merge` of a state with a shared clone of itself is the identity.

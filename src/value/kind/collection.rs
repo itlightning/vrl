@@ -249,6 +249,12 @@ impl<T: Ord + Clone> Collection<T> {
         self.unknown = self.unknown.to_kind().union(known_unknown).into();
     }
 
+    /// Conservative structural identity: `true` only when the two collections are certainly
+    /// equal. See [`Kind::is_identical`].
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        self.known.ptr_eq(&other.known) && self.unknown.is_identical(&other.unknown)
+    }
+
     /// Merge the `other` collection into `self`.
     ///
     /// The following merge strategies are applied.
