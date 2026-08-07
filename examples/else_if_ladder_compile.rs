@@ -268,7 +268,21 @@ fn parse_args() -> Args {
     }
 
     if program.is_none() && (arms.is_empty() || (fields == 0 && locals == 0 && coalesce == 0)) {
-        eprintln!("--arms and one of --fields/--locals/--coalesce must be non-zero, or pass --program");
+        eprintln!(
+            "--arms and one of --fields/--locals/--coalesce must be non-zero, or pass --program"
+        );
+        usage();
+    }
+    if program.is_none() && arms.iter().any(|&n| n == 0) {
+        // A zero-arm ladder would emit the trailing `} else {` with no opening `if`,
+        // producing a program that fails to parse rather than a zero baseline.
+        eprintln!("--arms entries must be > 0");
+        usage();
+    }
+    if coalesce_chain == 0 {
+        // `.max(1)` used to silently promote this to a single call while the run
+        // label still printed chain=0, mislabeling the measurement.
+        eprintln!("--coalesce-chain must be > 0");
         usage();
     }
     if repeat == 0 {
@@ -386,7 +400,7 @@ fn build_ladder(
 ) -> String {
     let coalesce_expr = |c: usize, fallback: &str| {
         let mut expr = String::new();
-        for _ in 0..coalesce_chain.max(1) {
+        for _ in 0..coalesce_chain {
             expr.push_str(&format!("to_string(.src{c}) ?? "));
         }
         expr.push_str(&format!("\"{fallback}\""));
@@ -532,12 +546,13 @@ fn main() {
     }
 
     println!(
-        "else-if ladder compile (fields/arm={}, locals/arm={}, coalesce/arm={} chain={} shared={}, {env}, warmup={}, repeat={})",
+        "else-if ladder compile (fields/arm={}, locals/arm={}, coalesce/arm={} chain={} shared={} fields-disjoint={}, {env}, warmup={}, repeat={})",
         args.fields,
         args.locals,
         args.coalesce,
         args.coalesce_chain,
         args.locals_shared,
+        args.fields_disjoint,
         args.warmup,
         args.repeat
     );
