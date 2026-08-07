@@ -267,8 +267,8 @@ fn parse_args() -> Args {
         }
     }
 
-    if program.is_none() && (arms.is_empty() || (fields == 0 && locals == 0)) {
-        eprintln!("--arms/--fields must be non-empty, or pass --program");
+    if program.is_none() && (arms.is_empty() || (fields == 0 && locals == 0 && coalesce == 0)) {
+        eprintln!("--arms and one of --fields/--locals/--coalesce must be non-zero, or pass --program");
         usage();
     }
     if repeat == 0 {
