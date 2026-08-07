@@ -269,4 +269,74 @@ mod tests {
             assert_eq!(this, merged, "{title}");
         }
     }
+
+    /// A `Kind` with nested objects and arrays, rebuilt from scratch on every call so two
+    /// calls are value-equal but share no `Arc`.
+    fn nested_kind() -> Kind {
+        Kind::bytes()
+            .or_object(BTreeMap::from([
+                ("a".into(), Kind::integer()),
+                (
+                    "b".into(),
+                    Kind::object(BTreeMap::from([("inner".into(), Kind::bytes())])),
+                ),
+            ]))
+            .or_array(BTreeMap::from([(0.into(), Kind::timestamp())]))
+    }
+
+    /// Merging a `Kind` with an `Arc`-shared clone of itself has to give the same answer as
+    /// merging it with a value-equal `Kind` that shares nothing, under every strategy.
+    #[test]
+    fn merge_shared_clone_matches_distinct_equal_kind() {
+        for collisions in [CollisionStrategy::Union, CollisionStrategy::Overwrite] {
+            let strategy = Strategy { collisions };
+            let this = nested_kind();
+
+            let mut from_shared = this.clone();
+            from_shared.merge(this.clone(), strategy);
+
+            let mut from_distinct = this.clone();
+            from_distinct.merge(nested_kind(), strategy);
+
+            assert_eq!(from_shared, from_distinct, "{collisions:?}");
+            assert_eq!(from_shared, this, "{collisions:?}");
+        }
+    }
+
+    #[test]
+    fn union_shared_clone_matches_distinct_equal_kind() {
+        let this = nested_kind();
+
+        assert_eq!(this.union(this.clone()), this.union(nested_kind()));
+        assert_eq!(this.union(this.clone()), this);
+    }
+
+    /// The guards must not swallow a merge that does change something: only one branch of
+    /// the tree is shared here, the rest genuinely differs.
+    #[test]
+    fn merge_partially_shared_kind_still_merges() {
+        let shared_branch = Kind::object(BTreeMap::from([("inner".into(), Kind::bytes())]));
+
+        let mut this = Kind::object(BTreeMap::from([
+            ("shared".into(), shared_branch.clone()),
+            ("own".into(), Kind::integer()),
+        ]));
+        let other = Kind::object(BTreeMap::from([
+            ("shared".into(), shared_branch),
+            ("own".into(), Kind::null()),
+        ]));
+
+        this.merge_keep(other, false);
+
+        assert_eq!(
+            this,
+            Kind::object(BTreeMap::from([
+                (
+                    "shared".into(),
+                    Kind::object(BTreeMap::from([("inner".into(), Kind::bytes())]))
+                ),
+                ("own".into(), Kind::integer().or_null()),
+            ]))
+        );
+    }
 }
