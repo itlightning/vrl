@@ -18,6 +18,12 @@ impl SharedBindings {
     fn into_map(self) -> HashMap<Ident, Details> {
         Arc::try_unwrap(self.0).unwrap_or_else(|arc| (*arc).clone())
     }
+
+    /// Whether both handles point at the same allocation, i.e. neither side has written
+    /// since the clone. Copy-on-write makes this a sound (one-sided) test for value equality.
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Deref for SharedBindings {
@@ -104,6 +110,11 @@ impl LocalEnv {
 
     /// Any state the child scope modified that was part of the parent is copied to the parent scope
     pub(crate) fn apply_child_scope(mut self, child: Self) -> Self {
+        // The child never wrote: every binding it could copy back is the one already here.
+        if self.bindings.ptr_eq(&child.bindings) {
+            return self;
+        }
+
         for (ident, child_details) in child.bindings.into_map() {
             if let Some(self_details) = self.bindings.make_mut().get_mut(&ident) {
                 *self_details = child_details;
@@ -117,6 +128,14 @@ impl LocalEnv {
     /// where different `LocalEnv`'s can be created, and the result is decided at runtime.
     /// The compile-time type must be the union of the options.
     pub(crate) fn merge(mut self, other: Self) -> Self {
+        // Neither side wrote since the fork, so every binding would be merged with itself.
+        // `Details::merge` is idempotent (`TypeDef::union` of equal type defs, and equal
+        // values are kept), so the whole merge is a no-op. This also avoids the
+        // `Arc::make_mut` deep copy of the binding map that the loop would otherwise force.
+        if self.bindings.ptr_eq(&other.bindings) {
+            return self;
+        }
+
         for (ident, other_details) in other.bindings.into_map() {
             let bindings = self.bindings.make_mut();
             if let Some(self_details) = bindings.get_mut(&ident) {
@@ -250,5 +269,123 @@ impl RuntimeState {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn details(type_def: TypeDef, value: Option<Value>) -> Details {
+        Details { type_def, value }
+    }
+
+    /// Two bindings whose kinds are deep enough that a merge is observable.
+    fn env(bar: TypeDef) -> LocalEnv {
+        let mut env = LocalEnv::default();
+        env.insert_variable(
+            Ident::new("foo"),
+            details(
+                TypeDef::object(Collection::from_parts(
+                    [("a".into(), Kind::integer())].into(),
+                    Kind::bytes(),
+                )),
+                Some(Value::from(1)),
+            ),
+        );
+        env.insert_variable(Ident::new("bar"), details(bar, None));
+        env
+    }
+
+    /// `LocalEnv::merge` short-circuits when both sides still share the binding map. The
+    /// result has to be what merging a *distinct but equal* env produces.
+    #[test]
+    fn merge_shared_bindings_matches_distinct_equal_env() {
+        let this = env(TypeDef::bytes());
+
+        // Same allocation (the short-circuit fires).
+        let shared = this.clone();
+        assert!(this.bindings.ptr_eq(&shared.bindings));
+
+        // Equal by value, separate allocation (the short-circuit cannot fire).
+        let distinct = env(TypeDef::bytes());
+        assert!(!this.bindings.ptr_eq(&distinct.bindings));
+
+        assert_eq!(this.clone().merge(shared), this.clone().merge(distinct));
+        assert_eq!(this.clone().merge(env(TypeDef::bytes())), this);
+    }
+
+    /// The short-circuit must not fire once either side has written.
+    #[test]
+    fn merge_diverged_bindings_still_unions() {
+        let this = env(TypeDef::bytes());
+        let mut other = this.clone();
+        other.insert_variable(Ident::new("bar"), details(TypeDef::integer(), None));
+        other.insert_variable(Ident::new("baz"), details(TypeDef::null(), None));
+
+        let merged = this.merge(other);
+
+        assert_eq!(
+            merged.variable(&Ident::new("bar")).unwrap().type_def,
+            TypeDef::bytes().or_integer()
+        );
+        assert_eq!(
+            merged.variable(&Ident::new("baz")).unwrap().type_def,
+            TypeDef::null()
+        );
+    }
+
+    #[test]
+    fn apply_child_scope_shared_matches_distinct_equal_env() {
+        let this = env(TypeDef::bytes());
+        let shared = this.clone();
+        let distinct = env(TypeDef::bytes());
+
+        assert_eq!(
+            this.clone().apply_child_scope(shared),
+            this.clone().apply_child_scope(distinct)
+        );
+        assert_eq!(this.clone().apply_child_scope(env(TypeDef::bytes())), this);
+    }
+
+    /// A child that did write still copies its updates back into the parent.
+    #[test]
+    fn apply_child_scope_diverged_child_overwrites() {
+        let this = env(TypeDef::bytes());
+        let mut child = this.clone();
+        child.insert_variable(Ident::new("bar"), details(TypeDef::integer(), None));
+        child.insert_variable(Ident::new("scoped"), details(TypeDef::null(), None));
+
+        let applied = this.apply_child_scope(child);
+
+        assert_eq!(
+            applied.variable(&Ident::new("bar")).unwrap().type_def,
+            TypeDef::integer()
+        );
+        assert!(applied.variable(&Ident::new("scoped")).is_none());
+    }
+
+    /// `TypeState::merge` of a state with a shared clone of itself is the identity.
+    #[test]
+    fn type_state_merge_with_shared_clone_is_identity() {
+        let state = TypeState {
+            local: env(TypeDef::bytes()),
+            external: ExternalEnv::new_with_kind(
+                Kind::object(Collection::from_parts(
+                    [("a".into(), Kind::integer())].into(),
+                    Kind::bytes(),
+                )),
+                Kind::object(Collection::any()),
+            ),
+        };
+
+        let merged = state.clone().merge(state.clone());
+
+        assert_eq!(merged.local, state.local);
+        assert_eq!(merged.external.target(), state.external.target());
+        assert_eq!(
+            merged.external.metadata_kind(),
+            state.external.metadata_kind()
+        );
     }
 }
