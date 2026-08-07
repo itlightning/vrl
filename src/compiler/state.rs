@@ -85,6 +85,10 @@ impl TypeState {
 
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
+        if self.is_identical(&other) {
+            return self;
+        }
+
         Self {
             local: self.local.merge(other.local),
             external: self.external.merge(other.external),
@@ -187,6 +191,10 @@ impl ExternalEnv {
 
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
+        if self.is_identical(&other) {
+            return self;
+        }
+
         Self {
             target: self.target.merge(other.target),
             metadata: self.metadata.union(other.metadata),

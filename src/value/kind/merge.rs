@@ -41,6 +41,15 @@ impl Kind {
     /// Merge `other` into `self`, optionally overwriting on conflicts.
     // deprecated
     pub fn merge_keep(&mut self, other: Self, overwrite: bool) {
+        // Merging a kind into an equal kind is the identity under either strategy:
+        // primitives are OR-ed with themselves, and every known key exists on both sides,
+        // so no field can hit the `unknown` fallback or pick up `undefined`. Bail out
+        // before descending, which is what keeps merges of pointer-shared subtrees cheap
+        // even when their parents differ.
+        if self.is_identical(&other) {
+            return;
+        }
+
         self.merge_primitives(&other);
         self.merge_objects(other.object, overwrite);
 

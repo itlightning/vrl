@@ -489,6 +489,12 @@ impl TypeDef {
 
     #[must_use]
     pub fn union(mut self, other: Self) -> Self {
+        // Unioning with an equal type def is the identity, and `Kind::union` would clone
+        // and walk the whole kind to prove it.
+        if self.is_identical(&other) {
+            return self;
+        }
+
         self.fallibility = Fallibility::merge(&self.fallibility, &other.fallibility);
         self.kind = self.kind.union(other.kind);
         self.purity = Purity::merge(&self.purity, &other.purity);
@@ -498,6 +504,10 @@ impl TypeDef {
 
     // deprecated
     pub fn merge(&mut self, other: Self, strategy: merge::Strategy) {
+        if self.is_identical(&other) {
+            return;
+        }
+
         self.fallibility = Fallibility::merge(&self.fallibility, &other.fallibility);
         self.kind.merge(other.kind, strategy);
         self.purity = Purity::merge(&self.purity, &other.purity);
@@ -563,6 +573,10 @@ impl Details {
 
     /// Returns the union of 2 possible states
     pub(crate) fn merge(self, other: Self) -> Self {
+        if self.is_identical(&other) {
+            return self;
+        }
+
         Self {
             type_def: self.type_def.union(other.type_def),
             value: if self.value == other.value {
@@ -579,6 +593,91 @@ mod test {
     use super::Fallibility::*;
     use super::Purity::*;
     use super::*;
+
+    /// Nested kind, rebuilt on each call, so two calls are equal but share no `Arc`.
+    fn nested() -> TypeDef {
+        TypeDef::object(std::collections::BTreeMap::from([
+            ("a".into(), Kind::integer()),
+            (
+                "b".into(),
+                Kind::object(std::collections::BTreeMap::from([(
+                    "inner".into(),
+                    Kind::bytes(),
+                )])),
+            ),
+        ]))
+        .fallible()
+    }
+
+    /// `union` / `merge` short-circuit on structural identity. Their answer has to match
+    /// what a value-equal but unshared operand produces.
+    #[test]
+    fn union_shared_matches_distinct_equal_type_def() {
+        let this = nested();
+
+        assert!(this.is_identical(&this.clone()));
+        assert!(!this.is_identical(&nested()));
+
+        assert_eq!(
+            this.clone().union(this.clone()),
+            this.clone().union(nested())
+        );
+        assert_eq!(this.clone().union(this.clone()), this);
+    }
+
+    #[test]
+    fn merge_shared_matches_distinct_equal_type_def() {
+        for collisions in [
+            merge::CollisionStrategy::Union,
+            merge::CollisionStrategy::Overwrite,
+        ] {
+            let strategy = merge::Strategy { collisions };
+            let this = nested();
+
+            let mut from_shared = this.clone();
+            from_shared.merge(this.clone(), strategy);
+
+            let mut from_distinct = this.clone();
+            from_distinct.merge(nested(), strategy);
+
+            assert_eq!(from_shared, from_distinct, "{collisions:?}");
+            assert_eq!(from_shared, this, "{collisions:?}");
+        }
+    }
+
+    /// The guards must not swallow a merge that changes something.
+    #[test]
+    fn union_diverged_type_defs_still_unions() {
+        let this = nested();
+        let other = nested().or_null().infallible();
+
+        assert_eq!(
+            this.clone().union(other),
+            nested().or_null(),
+            "fallibility and kind both widen"
+        );
+    }
+
+    #[test]
+    fn merge_details_shared_matches_distinct_equal_details() {
+        let this = Details {
+            type_def: nested(),
+            value: Some(Value::from(5)),
+        };
+        let distinct = Details {
+            type_def: nested(),
+            value: Some(Value::from(5)),
+        };
+
+        assert!(this.is_identical(&this.clone()));
+        assert!(!this.is_identical(&distinct));
+
+        assert_eq!(
+            this.clone().merge(this.clone()),
+            this.clone().merge(distinct)
+        );
+        assert_eq!(this.clone().merge(this.clone()), this);
+    }
 
     #[test]
     fn merge_details_same_literal() {
