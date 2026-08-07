@@ -138,6 +138,16 @@ impl Unknown {
         }
     }
 
+    /// Conservative structural identity: `true` only when the two states are certainly
+    /// equal. See [`Kind::is_identical`].
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Inner::Exact(lhs), Inner::Exact(rhs)) => lhs.is_identical(rhs),
+            (Inner::Infinite(lhs), Inner::Infinite(rhs)) => lhs == rhs,
+            _ => false,
+        }
+    }
+
     /// Merge `other` into `self`, using the provided `Strategy`.
     ///
     /// If any of the two `Unknown`s is marked as "infinite", it will overwrite the finite variant.

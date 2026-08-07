@@ -478,6 +478,15 @@ impl TypeDef {
         self
     }
 
+    /// Conservative structural identity: `true` only when the two type defs are certainly
+    /// equal. See [`Kind::is_identical`].
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        self.fallibility == other.fallibility
+            && self.purity == other.purity
+            && self.kind.is_identical(&other.kind)
+            && self.returns.is_identical(&other.returns)
+    }
+
     #[must_use]
     pub fn union(mut self, other: Self) -> Self {
         self.fallibility = Fallibility::merge(&self.fallibility, &other.fallibility);
@@ -546,6 +555,12 @@ pub(crate) struct Details {
 }
 
 impl Details {
+    /// Conservative structural identity: `true` only when the two details are certainly
+    /// equal. See [`Kind::is_identical`].
+    pub(crate) fn is_identical(&self, other: &Self) -> bool {
+        self.value == other.value && self.type_def.is_identical(&other.type_def)
+    }
+
     /// Returns the union of 2 possible states
     pub(crate) fn merge(self, other: Self) -> Self {
         Self {

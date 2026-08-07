@@ -164,7 +164,16 @@ impl Expression for Op {
         // if the RHS will be resolved, this should not be used
         let maybe_rhs = |state: &mut TypeState| {
             let rhs_info = self.rhs.type_info(state);
-            *state = state.clone().merge(rhs_info.state);
+
+            // Most real-world RHSs contribute no state delta at all: `<expr> ?? <literal>`
+            // is the dominant coalesce idiom, and literals, queries and variables all hand
+            // the state straight back. Merging a state with an equal state is the identity,
+            // so skip it when the two are structurally identical.
+            if !state.is_identical(&rhs_info.state) {
+                let lhs_state = std::mem::take(state);
+                *state = lhs_state.merge(rhs_info.state);
+            }
+
             rhs_info.result
         };
 
@@ -543,6 +552,65 @@ mod tests {
                 want,
                 "opcode {opcode:?} with lhs constant {value:?}"
             );
+        }
+    }
+
+    /// Compile `src` and return the event `Kind` the program ends with.
+    fn final_target_kind(src: &str) -> crate::value::Kind {
+        crate::compiler::compile(src, &crate::stdlib::all())
+            .unwrap_or_else(|diagnostics| panic!("compile failed: {diagnostics:?}"))
+            .program
+            .final_type_info()
+            .state
+            .external
+            .target_kind()
+            .clone()
+    }
+
+    /// The `Kind` of known field `.b` in a compiled program's final event kind.
+    fn final_kind_of_b(src: &str) -> crate::value::Kind {
+        final_target_kind(src)
+            .as_object()
+            .expect("object")
+            .known()
+            .get(&"b".into())
+            .expect("known field b")
+            .clone()
+    }
+
+    /// `maybe_rhs` skips the state merge when the RHS contributed no delta. These pin both
+    /// sides of that: an RHS that does change the state must still be merged, and an RHS
+    /// that does not must leave the state exactly as the LHS left it.
+    #[test]
+    fn coalesce_merges_rhs_state_only_when_it_changes() {
+        // `del` removes a known field, so the RHS state genuinely differs and the merge
+        // has to happen: `.b` only survives on the branch where the LHS succeeded, so it
+        // picks up `undefined` (and the target's `any` unknown).
+        let deleted = final_kind_of_b(".b = 1\nx = to_int(.a) ?? del(.b)\n.");
+        assert!(deleted.contains_undefined(), "{deleted:?}");
+
+        // A literal RHS contributes nothing, so the fast path fires. Neither side of the
+        // coalesce touches the event, so the event kind must be untouched too.
+        let with_literal = final_target_kind(".b = 1\nx = to_int(.a) ?? 0\n.");
+        assert_eq!(with_literal, final_target_kind(".b = 1\n."));
+
+        // ... and that is genuinely distinguishable from the merged case.
+        assert_ne!(deleted, final_kind_of_b(".b = 1\nx = to_int(.a) ?? 0\n."));
+    }
+
+    /// The same fast path is shared by `Or` and `And`, which reach it through their
+    /// "unknown whether the LHS is true" arms.
+    #[test]
+    fn logical_ops_merge_rhs_state_only_when_it_changes() {
+        // `||` is infallible here, `&&` is not, hence the different assignment forms.
+        for src in ["b = .flag || del(.b)", "b, err = .flag && del(.b)"] {
+            let deleted = final_kind_of_b(&format!(".b = 1\n{src}\n."));
+            assert!(deleted.contains_undefined(), "{src}: {deleted:?}");
+        }
+
+        for src in ["c = .flag || false", "c, err = .flag && false"] {
+            let with_literal = final_target_kind(&format!(".b = 1\n{src}\n."));
+            assert_eq!(with_literal, final_target_kind(".b = 1\n."), "{src}");
         }
     }
 
