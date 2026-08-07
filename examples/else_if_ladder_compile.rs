@@ -142,6 +142,8 @@ fn usage() -> ! {
   --arms             comma-separated else-if arm counts (default: 10,20,40,60,80)
   --fields           event-path assigns per synthetic ladder arm (default: 40)
   --locals L         local-variable assigns per synthetic ladder arm (default: 0)
+  --coalesce C       fallible-call `??` literal-fallback assigns per arm (default: 0)
+  --coalesce-chain N fallible calls chained by `??` per coalesce assign (default: 1)
   --locals-shared    reuse the same local names on every arm (fixed live set)
   --fields-disjoint  give every arm distinct event-field names (event Kind grows)
   --program          time compile of a VRL source file (skips synthetic ladder)
@@ -173,6 +175,10 @@ struct Args {
     fields: usize,
     /// Local-variable assigns per arm.
     locals: usize,
+    /// `to_string(.srcN) ?? "lit"` assigns per arm.
+    coalesce: usize,
+    /// Chained fallible calls per coalesce assign.
+    coalesce_chain: usize,
     /// Reuse the same local names on every arm (fixed live set).
     locals_shared: bool,
     /// Give every arm distinct event-field names (wide event `Kind`).
@@ -190,6 +196,8 @@ fn parse_args() -> Args {
     let mut arms = vec![10, 20, 40, 60, 80];
     let mut fields = 40;
     let mut locals = 0;
+    let mut coalesce = 0;
+    let mut coalesce_chain = 1;
     let mut locals_shared = false;
     let mut fields_disjoint = false;
     let mut warmup = 1;
@@ -216,6 +224,14 @@ fn parse_args() -> Args {
             "--locals" => {
                 let v = argv.next().unwrap_or_else(|| usage());
                 locals = v.parse().unwrap_or_else(|_| usage());
+            }
+            "--coalesce" => {
+                let v = argv.next().unwrap_or_else(|| usage());
+                coalesce = v.parse().unwrap_or_else(|_| usage());
+            }
+            "--coalesce-chain" => {
+                let v = argv.next().unwrap_or_else(|| usage());
+                coalesce_chain = v.parse().unwrap_or_else(|_| usage());
             }
             "--locals-shared" => locals_shared = true,
             "--fields-disjoint" => fields_disjoint = true,
@@ -268,6 +284,8 @@ fn parse_args() -> Args {
         arms,
         fields,
         locals,
+        coalesce,
+        coalesce_chain,
         locals_shared,
         fields_disjoint,
         warmup,
@@ -361,9 +379,19 @@ fn build_ladder(
     arm_count: usize,
     fields_per_arm: usize,
     locals_per_arm: usize,
+    coalesce_per_arm: usize,
+    coalesce_chain: usize,
     locals_shared: bool,
     fields_disjoint: bool,
 ) -> String {
+    let coalesce_expr = |c: usize, fallback: &str| {
+        let mut expr = String::new();
+        for _ in 0..coalesce_chain.max(1) {
+            expr.push_str(&format!("to_string(.src{c}) ?? "));
+        }
+        expr.push_str(&format!("\"{fallback}\""));
+        expr
+    };
     let field_name = |i: usize, f: usize| {
         if fields_disjoint {
             format!("f{i}_{f}")
@@ -391,6 +419,12 @@ fn build_ladder(
         for f in 0..fields_per_arm {
             out.push_str(&format!("  ._itl.{} = \"a{i}_f{f}\"\n", field_name(i, f)));
         }
+        for c in 0..coalesce_per_arm {
+            out.push_str(&format!(
+                "  ._itl.c{c} = {}\n",
+                coalesce_expr(c, &format!("a{i}_c{c}"))
+            ));
+        }
         for j in 0..locals_per_arm {
             out.push_str(&format!("  {} = \"a{i}_l{j}\"\n", local_name(i, j)));
         }
@@ -402,6 +436,12 @@ fn build_ladder(
         out.push_str(&format!(
             "  ._itl.{} = \"else_f{f}\"\n",
             field_name(arm_count, f)
+        ));
+    }
+    for c in 0..coalesce_per_arm {
+        out.push_str(&format!(
+            "  ._itl.c{c} = {}\n",
+            coalesce_expr(c, &format!("else_c{c}"))
         ));
     }
     for j in 0..locals_per_arm {
@@ -492,8 +532,14 @@ fn main() {
     }
 
     println!(
-        "else-if ladder compile (fields/arm={}, locals/arm={} shared={}, {env}, warmup={}, repeat={})",
-        args.fields, args.locals, args.locals_shared, args.warmup, args.repeat
+        "else-if ladder compile (fields/arm={}, locals/arm={}, coalesce/arm={} chain={} shared={}, {env}, warmup={}, repeat={})",
+        args.fields,
+        args.locals,
+        args.coalesce,
+        args.coalesce_chain,
+        args.locals_shared,
+        args.warmup,
+        args.repeat
     );
     println!(
         "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}",
@@ -505,6 +551,8 @@ fn main() {
             n,
             args.fields,
             args.locals,
+            args.coalesce,
+            args.coalesce_chain,
             args.locals_shared,
             args.fields_disjoint,
         );
