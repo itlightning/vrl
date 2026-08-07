@@ -48,6 +48,14 @@ impl<T: Ord + Clone> SharedMap<T> {
     }
 }
 
+impl<T: Ord> SharedMap<T> {
+    /// Whether both handles point at the same allocation, i.e. neither side has written
+    /// since the clone. Copy-on-write makes this a sound (one-sided) test for value equality.
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl<T: Ord> Deref for SharedMap<T> {
     type Target = BTreeMap<T, Kind>;
 
@@ -257,6 +265,17 @@ impl<T: Ord + Clone> Collection<T> {
     ///
     /// - Both `Unknown`s are merged, similar to merging two `Kind`s.
     pub fn merge(&mut self, other: Self, overwrite: bool) {
+        // Both sides still share the map they were cloned from, so the known-field pass would
+        // pair every key with an identical `Kind`: `merge_keep` of a `Kind` with itself is
+        // identity under either strategy, no key is missing from the other side (so neither
+        // the `unknown` fallback nor `add_undefined` applies), and nothing is left over to
+        // insert. Only the `unknown` states can still differ. Skipping the pass also avoids
+        // the `Arc::make_mut` deep copy of the whole known map.
+        if self.known.ptr_eq(&other.known) {
+            self.unknown.merge(other.unknown, overwrite);
+            return;
+        }
+
         let mut other_known = other.known.into_map();
         let other_unknown = other.unknown;
 
@@ -452,6 +471,120 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// Known map with a nested object, so a merge that descends is observable.
+    fn known() -> BTreeMap<&'static str, Kind> {
+        BTreeMap::from([
+            ("a", Kind::integer()),
+            (
+                "b",
+                Kind::object(Collection::from_parts(
+                    BTreeMap::from([(Field::from("inner"), Kind::bytes())]),
+                    Kind::null(),
+                )),
+            ),
+        ])
+    }
+
+    fn collection(unknown: Kind) -> Collection<&'static str> {
+        Collection::from_parts(known(), unknown)
+    }
+
+    /// `Collection::merge` short-circuits the known-field pass when both sides still share
+    /// the known map. For every strategy, the result has to equal what merging a *distinct
+    /// but equal* collection produces, and (here) the unchanged original.
+    #[test]
+    fn merge_shared_known_map_matches_distinct_equal_collection() {
+        for overwrite in [false, true] {
+            let this = collection(Kind::bytes());
+
+            // Same allocation: the short-circuit fires.
+            let shared = this.clone();
+            assert!(this.known.ptr_eq(&shared.known));
+
+            // Equal by value, separate allocation: the short-circuit cannot fire.
+            let distinct = collection(Kind::bytes());
+            assert!(!this.known.ptr_eq(&distinct.known));
+
+            let mut from_shared = this.clone();
+            from_shared.merge(shared, overwrite);
+
+            let mut from_distinct = this.clone();
+            from_distinct.merge(distinct, overwrite);
+
+            assert_eq!(from_shared, from_distinct, "overwrite={overwrite}");
+            assert_eq!(from_shared, this, "overwrite={overwrite}");
+        }
+    }
+
+    /// Sharing the known map does not imply the `unknown` states agree: `set_unknown` does
+    /// not touch the map, so the short-circuit still has to merge the unknowns.
+    #[test]
+    fn merge_shared_known_map_still_merges_unknown() {
+        for overwrite in [false, true] {
+            let this = collection(Kind::bytes());
+
+            let mut shared = this.clone();
+            shared.set_unknown(Kind::integer());
+            assert!(this.known.ptr_eq(&shared.known));
+
+            let mut distinct = collection(Kind::integer());
+            distinct.set_unknown(Kind::integer());
+            assert!(!this.known.ptr_eq(&distinct.known));
+
+            let mut from_shared = this.clone();
+            from_shared.merge(shared, overwrite);
+
+            let mut from_distinct = this.clone();
+            from_distinct.merge(distinct, overwrite);
+
+            assert_eq!(from_shared, from_distinct, "overwrite={overwrite}");
+            assert_eq!(
+                from_shared.unknown_kind(),
+                collection(Kind::bytes().or_integer()).unknown_kind(),
+                "overwrite={overwrite}"
+            );
+        }
+    }
+
+    /// The parent maps differ, but one entry's nested object still shares its map with the
+    /// other side. The nested short-circuit must produce the same answer as a deep clone.
+    #[test]
+    fn merge_shared_nested_subtree_inside_differing_parent() {
+        for overwrite in [false, true] {
+            let nested = Kind::object(Collection::from_parts(
+                BTreeMap::from([(Field::from("inner"), Kind::bytes())]),
+                Kind::null(),
+            ));
+            // Rebuilt from scratch: equal to `nested`, but its known map is a separate
+            // allocation, so the nested short-circuit cannot fire.
+            let nested_distinct = Kind::object(Collection::from_parts(
+                BTreeMap::from([(Field::from("inner"), Kind::bytes())]),
+                Kind::null(),
+            ));
+
+            let this = Collection::from_parts(
+                BTreeMap::from([("shared", nested.clone()), ("own", Kind::integer())]),
+                Kind::bytes(),
+            );
+            let other_shared = Collection::from_parts(
+                BTreeMap::from([("shared", nested), ("own", Kind::null())]),
+                Kind::bytes(),
+            );
+            let other_distinct = Collection::from_parts(
+                BTreeMap::from([("shared", nested_distinct), ("own", Kind::null())]),
+                Kind::bytes(),
+            );
+
+            let mut from_shared = this.clone();
+            from_shared.merge(other_shared, overwrite);
+
+            let mut from_distinct = this.clone();
+            from_distinct.merge(other_distinct, overwrite);
+
+            assert_eq!(from_shared, from_distinct, "overwrite={overwrite}");
+        }
+    }
 
     impl CollectionKey for &'static str {
         fn to_segment(&self) -> OwnedSegment {

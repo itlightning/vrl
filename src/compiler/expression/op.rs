@@ -142,11 +142,18 @@ impl Expression for Op {
     fn type_info(&self, state: &TypeState) -> TypeInfo {
         use crate::value::Kind as K;
         use ast::Opcode::{Add, And, Div, Eq, Err, Ge, Gt, Le, Lt, Merge, Mul, Ne, Or, Sub};
-        let original_state = state.clone();
+
+        // Only the `Or` and `And` arms read the constant-folded LHS, and it has to be
+        // resolved against the pre-LHS state. Resolving it for every operator meant every
+        // binary expression (notably `??`) paid a full `TypeState` clone to hold that state.
+        let lhs_value = if matches!(self.opcode, Or | And) {
+            self.lhs.resolve_constant(state)
+        } else {
+            None
+        };
 
         let mut state = state.clone();
         let mut lhs_def = self.lhs.apply_type_info(&mut state);
-        let lhs_value = self.lhs.resolve_constant(&original_state);
 
         // TODO: this is incorrect, but matches the existing behavior of the compiler
         // see: https://github.com/vectordotdev/vector/issues/13789
@@ -471,6 +478,72 @@ mod tests {
 
     fn f(f: f64) -> NotNan<f64> {
         NotNan::new(f).unwrap()
+    }
+
+    /// `Or`/`And` constant-fold the LHS, and that fold has to see the state as it was
+    /// *before* the LHS was applied. A `Variable` LHS is the only expression whose
+    /// constant depends on the local env, so it is what pins the state that is passed in.
+    #[test]
+    fn or_and_constant_fold_lhs_variable() {
+        struct Case {
+            opcode: ast::Opcode,
+            value: Value,
+            want: TypeDef,
+        }
+
+        for Case {
+            opcode,
+            value,
+            want,
+        } in [
+            // lhs is always false -> the whole expression is the rhs
+            Case {
+                opcode: Or,
+                value: Value::Boolean(false),
+                want: TypeDef::bytes(),
+            },
+            // lhs is always true -> the whole expression is the lhs
+            Case {
+                opcode: Or,
+                value: Value::Boolean(true),
+                want: TypeDef::boolean(),
+            },
+            Case {
+                opcode: And,
+                value: Value::Boolean(false),
+                want: TypeDef::boolean(),
+            },
+            Case {
+                opcode: And,
+                value: Value::Boolean(true),
+                want: TypeDef::boolean(),
+            },
+        ] {
+            let mut state = TypeState::default();
+            state.local.insert_variable(
+                Ident::new("foo"),
+                crate::compiler::type_def::Details {
+                    type_def: TypeDef::boolean(),
+                    value: Some(value.clone()),
+                },
+            );
+
+            let expr = Op {
+                lhs: Box::new(
+                    Variable::new(Span::default(), Ident::new("foo"), &state.local)
+                        .unwrap()
+                        .into(),
+                ),
+                rhs: Box::new(Literal::from("bar").into()),
+                opcode,
+            };
+
+            assert_eq!(
+                expr.type_def(&state),
+                want,
+                "opcode {opcode:?} with lhs constant {value:?}"
+            );
+        }
     }
 
     test_type_def![
