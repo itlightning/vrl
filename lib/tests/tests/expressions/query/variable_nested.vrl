@@ -1,0 +1,4 @@
+# result: 42
+
+foo = { "bar": { "baz": [1, 42] } }
+foo.bar.baz[1]

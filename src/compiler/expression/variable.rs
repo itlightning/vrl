@@ -1,12 +1,13 @@
 use crate::compiler::codes;
 use crate::diagnostic::{DiagnosticMessage, Label};
 use crate::value::Value;
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::compiler::state::{TypeInfo, TypeState};
 use crate::compiler::{
     Context, Expression, Span, TypeDef,
-    expression::{Resolved, levenstein},
+    expression::{ExpressionError, Resolved, levenstein},
     parser::ast::Ident,
     state::LocalEnv,
 };
@@ -43,6 +44,15 @@ impl Expression for Variable {
             .variable(&self.ident)
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    fn resolve_ref<'a>(&self, ctx: &'a mut Context<'_>) -> Result<Cow<'a, Value>, ExpressionError> {
+        // The value lives in the runtime state for as long as the borrow of the
+        // context lasts, so hand back a borrow rather than a copy.
+        Ok(ctx
+            .state()
+            .variable(&self.ident)
+            .map_or(Cow::Owned(Value::Null), Cow::Borrowed))
     }
 
     fn resolve_constant(&self, state: &TypeState) -> Option<Value> {

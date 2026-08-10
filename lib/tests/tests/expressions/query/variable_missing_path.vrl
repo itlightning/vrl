@@ -1,0 +1,4 @@
+# result: null
+
+foo = { "bar": 2 }
+foo.baz

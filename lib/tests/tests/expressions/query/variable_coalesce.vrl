@@ -1,0 +1,9 @@
+# object: { "raw": "{ \"b\": 2 }" }
+# result: [2, 3]
+
+foo = parse_json!(.raw)
+
+[
+    int(foo.a) ?? int(foo.b) ?? 0,
+    int(foo.a) ?? int(foo.c) ?? 3,
+]

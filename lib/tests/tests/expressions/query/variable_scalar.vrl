@@ -1,0 +1,10 @@
+# result: [null, null, null]
+
+foo = 42
+bar = "text"
+
+[
+    foo.baz,
+    foo[0],
+    bar.baz,
+]

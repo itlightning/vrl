@@ -172,7 +172,9 @@ pub(crate) struct GetFn {
 impl FunctionExpression for GetFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
         let path = self.path.resolve(ctx)?;
-        let value = self.value.resolve(ctx)?;
+        // Only the selected leaf is cloned out, so borrow the queried value
+        // instead of materializing it.
+        let value = self.value.resolve_ref(ctx)?;
 
         get(&value, path)
     }

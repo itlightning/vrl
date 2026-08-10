@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use dyn_clone::{DynClone, clone_trait_object};
@@ -63,6 +64,21 @@ pub trait Expression: Send + Sync + fmt::Debug + DynClone {
     ///
     /// An expression is allowed to fail, which aborts the running program.
     fn resolve(&self, ctx: &mut Context) -> Resolved;
+
+    /// Resolve an expression to a [`Value`] that may borrow from `ctx`.
+    ///
+    /// Callers that only need to read the result should prefer this over
+    /// [`Expression::resolve`]: expressions whose value already lives in the
+    /// runtime state or the event (variables and their paths) can hand back a
+    /// borrow instead of deep-cloning a whole object to have one field read off
+    /// the copy.
+    ///
+    /// The default implementation materializes, which is always correct. Only
+    /// expressions that own nothing themselves, and read out of something that
+    /// outlives the call, can do better.
+    fn resolve_ref<'a>(&self, ctx: &'a mut Context<'_>) -> Result<Cow<'a, Value>, ExpressionError> {
+        self.resolve(ctx).map(Cow::Owned)
+    }
 
     /// Resolve an expression to a value without any context, if possible.
     /// This attempts to resolve expressions using only compile-time information.
@@ -247,6 +263,28 @@ impl Expression for Expr {
             Unary(v) => v.resolve(ctx),
             Abort(v) => v.resolve(ctx),
             Return(v) => v.resolve(ctx),
+        }
+    }
+
+    fn resolve_ref<'a>(&self, ctx: &'a mut Context<'_>) -> Result<Cow<'a, Value>, ExpressionError> {
+        use Expr::{
+            Abort, Assignment, Container, FunctionCall, IfStatement, Literal, Noop, Op, Query,
+            Return, Unary, Variable,
+        };
+
+        match self {
+            Literal(v) => v.resolve_ref(ctx),
+            Container(v) => v.resolve_ref(ctx),
+            IfStatement(v) => v.resolve_ref(ctx),
+            Op(v) => v.resolve_ref(ctx),
+            Assignment(v) => v.resolve_ref(ctx),
+            Query(v) => v.resolve_ref(ctx),
+            FunctionCall(v) => v.resolve_ref(ctx),
+            Variable(v) => v.resolve_ref(ctx),
+            Noop(v) => v.resolve_ref(ctx),
+            Unary(v) => v.resolve_ref(ctx),
+            Abort(v) => v.resolve_ref(ctx),
+            Return(v) => v.resolve_ref(ctx),
         }
     }
 

@@ -1,0 +1,15 @@
+# object: { "ext": { "bar": 5 } }
+# result: [5, 5, 5, 5, 5, 5, null, null]
+
+foo = { "bar": 5, "list": [5] }
+
+[
+    get!(foo, ["bar"]),
+    get!(foo, ["list", 0]),
+    get!(foo.list, [0]),
+    get!(., ["ext", "bar"]),
+    get!(parse_json!("{ \"bar\": 5 }"), ["bar"]),
+    get!({ "bar": 5 }, ["bar"]),
+    get!(foo, ["missing"]),
+    get!(foo, []).missing,
+]
