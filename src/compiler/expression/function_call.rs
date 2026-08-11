@@ -390,6 +390,49 @@ impl<'a> Builder<'a> {
         Ok(closure)
     }
 
+    /// The arguments the compiled call has to keep so that `FunctionCall::type_info`
+    /// can replay their type-state side effects.
+    ///
+    /// The compiled `expr` already owns everything the *runtime* evaluates, so the
+    /// argument ASTs are otherwise compile-time-only data: a second, deep copy of
+    /// every argument's expression tree, retained for the life of the program. The
+    /// single post-compile reader is `type_info`, which applies each argument to the
+    /// incoming type state before applying `expr`. Diagnostics need the argument
+    /// *text*, but that is rendered once at compile time into `arguments_fmt` and
+    /// does not need the trees.
+    ///
+    /// So replay the arguments here, against the state the call is compiled in, and
+    /// keep only the ones that actually move the state. Dropping an argument that
+    /// leaves the state untouched cannot change the result of the sequence: every
+    /// remaining argument is still applied to exactly the state it would have seen.
+    /// `TypeState::is_identical` is one-sided, answering `false` whenever equality is
+    /// not certain, so an argument is dropped only when it is provably inert.
+    ///
+    /// The residual assumption is that whether an argument perturbs the type state is
+    /// a property of its shape (does it contain an assignment, a `del`, ...) rather
+    /// than of the state it is applied to, since `type_info` may later run against a
+    /// different state than the one probed here. That holds for the state-mutating
+    /// expressions VRL has, but it is an assumption and not a proof.
+    fn retain_state_mutating_arguments(
+        arguments: &[Node<FunctionArgument>],
+        state_before_function_args: &TypeState,
+    ) -> Arc<Vec<Node<FunctionArgument>>> {
+        let mut state = state_before_function_args.clone();
+        let mut retained = Vec::new();
+
+        for node in arguments {
+            let before = state.clone();
+            let _result = node.inner().expr().apply_type_info(&mut state);
+
+            if !state.is_identical(&before) {
+                retained.push(node.clone());
+            }
+        }
+
+        retained.shrink_to_fit();
+        Arc::new(retained)
+    }
+
     pub(crate) fn compile(
         mut self,
         state_before_function_args: &TypeState,
@@ -480,7 +523,15 @@ impl<'a> Builder<'a> {
                 closure_fallible,
                 span: call_span,
                 ident: self.function.identifier(),
-                arguments: self.arguments.clone(),
+                state_mutating_arguments: Self::retain_state_mutating_arguments(
+                    &self.arguments,
+                    state_before_function_args,
+                ),
+                arguments_fmt: self
+                    .arguments
+                    .iter()
+                    .map(|arg| arg.inner().to_string().into_boxed_str())
+                    .collect(),
                 warnings,
             },
             error: invalid_argument_error,
@@ -559,79 +610,35 @@ pub struct FunctionCall {
     // used for equality check
     pub(crate) ident: &'static str,
 
-    arguments: Arc<Vec<Node<FunctionArgument>>>,
+    /// The subset of the call's arguments that perturb the type state, kept so that
+    /// `type_info` can replay them. Compile-time-inert arguments are dropped rather
+    /// than retained for the life of the program; see
+    /// `Builder::retain_state_mutating_arguments`. Not the full argument list, so it
+    /// must not be used to render the call.
+    state_mutating_arguments: Arc<Vec<Node<FunctionArgument>>>,
+
+    /// Every argument as the user wrote it, rendered at compile time.
+    ///
+    /// Diagnostics quote a call back to the user, including the suggested rewrite for
+    /// a fallible assignment (`sha3!(.foo)`), so the argument *text* has to survive
+    /// even though the argument *trees* do not. The rendered text is a fraction of
+    /// the tree it came from, and one field keeps `Expr` at 144 bytes.
+    ///
+    /// Only the `Display` rendering is kept. `Debug` prints these too, which loses
+    /// the AST detail a `{:?}` on a compiled program used to show; that detail is a
+    /// developer aid with no contract, whereas the `Display` text is quoted into
+    /// user-facing diagnostics, and the `Debug` rendering of an expression tree is
+    /// several times the size of its `Display` rendering.
+    arguments_fmt: Arc<[Box<str>]>,
 
     pub(crate) warnings: Vec<Warning>,
 }
 
 impl FunctionCall {
-    /// Takes the arguments passed and resolves them into the order they are defined
-    /// in the function
-    /// The error path in this function should never really be hit as the compiler should
-    /// catch these whilst creating the AST.
-    // May be used by the LLVM runtime. If not, it should be removed
-    #[allow(dead_code)]
-    fn resolve_arguments(
-        &self,
-        function: &dyn Function,
-    ) -> Result<Vec<(&'static str, Option<FunctionArgument>)>, String> {
-        let params = function.parameters().to_vec();
-        let mut result = params
-            .iter()
-            .map(|param| (param.keyword, None))
-            .collect::<Vec<_>>();
-
-        let mut unnamed = Vec::new();
-
-        // Position all the named parameters, keeping track of all the unnamed for later.
-        for param in self.arguments.iter() {
-            match param.keyword() {
-                None => unnamed.push(param.clone().take().1),
-                Some(keyword) => {
-                    match params.iter().position(|param| param.keyword == keyword) {
-                        None => {
-                            // The parameter was not found in the list.
-                            return Err(format!("parameter {keyword} not found."));
-                        }
-                        Some(pos) => {
-                            result[pos].1 = Some(param.clone().take().1);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Position all the remaining unnamed parameters
-        let mut pos = 0;
-        for param in unnamed {
-            while result[pos].1.is_some() {
-                pos += 1;
-            }
-
-            if pos > result.len() {
-                return Err("Too many parameters".to_string());
-            }
-
-            result[pos].1 = Some(param);
-        }
-
-        Ok(result)
-    }
-
+    /// Every argument as it was written, rendered at compile time.
     #[must_use]
     pub fn arguments_fmt(&self) -> Vec<String> {
-        self.arguments
-            .iter()
-            .map(|arg| arg.inner().to_string())
-            .collect::<Vec<_>>()
-    }
-
-    #[must_use]
-    pub fn arguments_dbg(&self) -> Vec<String> {
-        self.arguments
-            .iter()
-            .map(|arg| format!("{:?}", arg.inner()))
-            .collect::<Vec<_>>()
+        self.arguments_fmt.iter().map(ToString::to_string).collect()
     }
 }
 
@@ -684,7 +691,10 @@ impl Expression for FunctionCall {
         // This doesn't actually match current runtime behavior in some cases,
         // but that will be changed.
         // see: https://github.com/vectordotdev/vector/issues/13752
-        for arg_node in &*self.arguments {
+        //
+        // Only the arguments that move the state are retained past compilation; the
+        // rest are inert here by construction.
+        for arg_node in &*self.state_mutating_arguments {
             let _result = arg_node.inner().expr().apply_type_info(&mut state);
         }
 
@@ -801,7 +811,7 @@ impl fmt::Debug for FunctionCall {
 
         f.write_str("(")?;
 
-        let arguments = self.arguments_dbg();
+        let arguments = self.arguments_fmt();
         let mut iter = arguments.iter().peekable();
         while let Some(arg) = iter.next() {
             f.write_str(arg)?;
@@ -1314,6 +1324,40 @@ mod tests {
         )
     }
 
+    /// An argument whose expression assigns to a local, which moves the type state.
+    fn create_assignment_argument(
+        ident: Option<&str>,
+        variable: &str,
+        value: i64,
+    ) -> FunctionArgument {
+        use crate::compiler::expression::{Assignment, Expr, Literal, assignment};
+        use crate::parser::ast::AssignmentTarget;
+
+        // `Assignment::new` derives the assignment span from the gap between target
+        // and expression, so these two need distinct, non-zero-start spans.
+        let assignment = Assignment::new(
+            create_node(assignment::Variant::Single {
+                target: Node::new(
+                    Span::new(0, 1),
+                    AssignmentTarget::Internal(Ident::new(variable), None),
+                ),
+                expr: Box::new(Node::new(
+                    Span::new(4, 5),
+                    Expr::Literal(Literal::Integer(value)),
+                )),
+            }),
+            &TypeState::default(),
+            None,
+            &CompileConfig::default(),
+        )
+        .expect("valid assignment");
+
+        FunctionArgument::new(
+            ident.map(|ident| create_node(Ident::new(ident))),
+            create_node(Expr::Assignment(assignment)),
+        )
+    }
+
     fn create_function_call(arguments: Vec<Node<FunctionArgument>>) -> FunctionCall {
         let mut state = TypeState::default();
         let original_state = state.clone();
@@ -1340,93 +1384,59 @@ mod tests {
         .function_call
     }
 
+    /// Inert arguments are compile-time-only data and must not survive compilation.
     #[test]
-    fn resolve_arguments_simple() {
+    fn inert_arguments_are_not_retained() {
         let call = create_function_call(vec![
             create_node(create_argument(None, 1)),
-            create_node(create_argument(None, 2)),
+            create_node(create_argument(Some("two"), 2)),
             create_node(create_argument(None, 3)),
         ]);
 
-        let params = call.resolve_arguments(&TestFn);
-        let expected: Vec<(&'static str, Option<FunctionArgument>)> = vec![
-            ("one", Some(create_argument(None, 1))),
-            ("two", Some(create_argument(None, 2))),
-            ("three", Some(create_argument(None, 3))),
-        ];
-
-        assert_eq!(Ok(expected), params);
+        assert!(call.state_mutating_arguments.is_empty());
     }
 
+    /// Diagnostics quote the call back to the user, so the argument text survives even
+    /// though the argument trees do not.
     #[test]
-    fn resolve_arguments_named() {
+    fn argument_text_survives_compilation() {
         let call = create_function_call(vec![
-            create_node(create_argument(Some("one"), 1)),
-            create_node(create_argument(Some("two"), 2)),
-            create_node(create_argument(Some("three"), 3)),
-        ]);
-
-        let params = call.resolve_arguments(&TestFn);
-        let expected: Vec<(&'static str, Option<FunctionArgument>)> = vec![
-            ("one", Some(create_argument(Some("one"), 1))),
-            ("two", Some(create_argument(Some("two"), 2))),
-            ("three", Some(create_argument(Some("three"), 3))),
-        ];
-
-        assert_eq!(Ok(expected), params);
-    }
-
-    #[test]
-    fn resolve_arguments_named_unordered() {
-        let call = create_function_call(vec![
-            create_node(create_argument(Some("three"), 3)),
-            create_node(create_argument(Some("two"), 2)),
-            create_node(create_argument(Some("one"), 1)),
-        ]);
-
-        let params = call.resolve_arguments(&TestFn);
-        let expected: Vec<(&'static str, Option<FunctionArgument>)> = vec![
-            ("one", Some(create_argument(Some("one"), 1))),
-            ("two", Some(create_argument(Some("two"), 2))),
-            ("three", Some(create_argument(Some("three"), 3))),
-        ];
-
-        assert_eq!(Ok(expected), params);
-    }
-
-    #[test]
-    fn resolve_arguments_unnamed_unordered_one() {
-        let call = create_function_call(vec![
-            create_node(create_argument(Some("three"), 3)),
-            create_node(create_argument(None, 2)),
-            create_node(create_argument(Some("one"), 1)),
-        ]);
-
-        let params = call.resolve_arguments(&TestFn);
-        let expected: Vec<(&'static str, Option<FunctionArgument>)> = vec![
-            ("one", Some(create_argument(Some("one"), 1))),
-            ("two", Some(create_argument(None, 2))),
-            ("three", Some(create_argument(Some("three"), 3))),
-        ];
-
-        assert_eq!(Ok(expected), params);
-    }
-
-    #[test]
-    fn resolve_arguments_unnamed_unordered_two() {
-        let call = create_function_call(vec![
-            create_node(create_argument(Some("three"), 3)),
             create_node(create_argument(None, 1)),
-            create_node(create_argument(None, 2)),
+            create_node(create_argument(Some("two"), 2)),
         ]);
 
-        let params = call.resolve_arguments(&TestFn);
-        let expected: Vec<(&'static str, Option<FunctionArgument>)> = vec![
-            ("one", Some(create_argument(None, 1))),
-            ("two", Some(create_argument(None, 2))),
-            ("three", Some(create_argument(Some("three"), 3))),
-        ];
+        assert!(call.state_mutating_arguments.is_empty());
+        assert_eq!(vec!["1", "2"], call.arguments_fmt());
+        assert_eq!("test(1, 2)", call.to_string());
+    }
 
-        assert_eq!(Ok(expected), params);
+    /// An argument that moves the type state is still replayed by `type_info`, so it
+    /// has to be retained.
+    #[test]
+    fn state_mutating_arguments_are_retained() {
+        let call = create_function_call(vec![
+            create_node(create_argument(None, 1)),
+            create_node(create_assignment_argument(Some("two"), "captured", 7)),
+            create_node(create_argument(None, 3)),
+        ]);
+
+        assert_eq!(1, call.state_mutating_arguments.len());
+        assert_eq!(
+            Some("two"),
+            call.state_mutating_arguments[0].inner().keyword()
+        );
+    }
+
+    /// Retaining the assignment keeps the variable visible to whatever the call is
+    /// composed into, exactly as it was before inert arguments were dropped.
+    #[test]
+    fn retained_assignment_still_applies_its_side_effect() {
+        let call = create_function_call(vec![create_node(create_assignment_argument(
+            None, "captured", 7,
+        ))]);
+
+        let state = call.type_info(&TypeState::default()).state;
+
+        assert!(state.local.variable(&Ident::new("captured")).is_some());
     }
 }
