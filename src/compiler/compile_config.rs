@@ -1,16 +1,33 @@
 use crate::path::OwnedTargetPath;
+use crate::value::ValueRegex;
 use std::{
     any::{Any, TypeId},
     collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 type AnyMap = HashMap<TypeId, Box<dyn Any>>;
+
+/// Compiled regex literals, keyed by pattern, shared by every compilation that is
+/// handed the same handle.
+///
+/// A compiled `Regex` is roughly 56 KiB of automata and [`ValueRegex`] is already an
+/// `Arc<Regex>`, so identical literals can share one object instead of one each.
+///
+/// **Scope this to a compile session and no longer.** The cache pins every pattern it
+/// has seen, so a process-lifetime handle is a retention bug: patterns from programs
+/// that have since been discarded would never be freed. Drop the handle when the
+/// session ends, and only the regexes a live `Program` still references survive.
+pub type RegexCache = Arc<Mutex<HashMap<String, ValueRegex>>>;
 
 pub struct CompileConfig {
     /// Custom context injected by the external environment
     custom: AnyMap,
     read_only_paths: BTreeSet<ReadOnlyPath>,
     check_unused_expressions: bool,
+    /// Shared regex-literal cache, when the caller opted in. `None` compiles every
+    /// literal on its own, which is the historical behavior.
+    regex_cache: Option<RegexCache>,
 }
 
 impl Default for CompileConfig {
@@ -19,6 +36,7 @@ impl Default for CompileConfig {
             custom: AnyMap::default(),
             read_only_paths: BTreeSet::default(),
             check_unused_expressions: true,
+            regex_cache: None,
         }
     }
 }
@@ -89,6 +107,40 @@ impl CompileConfig {
     pub fn disable_unused_expression_check(&mut self) {
         self.check_unused_expressions = false;
     }
+
+    /// Share one [`RegexCache`] with every other compilation handed the same handle,
+    /// so that a pattern appearing in several programs is compiled once.
+    ///
+    /// The handle must not outlive the compile session. See [`RegexCache`].
+    pub fn set_regex_cache(&mut self, cache: RegexCache) {
+        self.regex_cache = Some(cache);
+    }
+
+    /// The shared regex-literal cache, if one was set.
+    #[must_use]
+    pub fn regex_cache(&self) -> Option<&RegexCache> {
+        self.regex_cache.as_ref()
+    }
+
+    /// Compiles a regex literal, reusing the cached automata when this config shares a
+    /// [`RegexCache`] with a compilation that already saw the same pattern.
+    pub(crate) fn compile_regex_literal(&self, pattern: &str) -> Result<ValueRegex, regex::Error> {
+        let Some(cache) = &self.regex_cache else {
+            return regex::Regex::new(pattern).map(|regex| ValueRegex::new(Arc::new(regex)));
+        };
+
+        // A poisoned cache is still a valid cache: the map is only ever inserted into.
+        let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if let Some(regex) = cache.get(pattern) {
+            return Ok(regex.clone());
+        }
+
+        let regex = ValueRegex::new(Arc::new(regex::Regex::new(pattern)?));
+        cache.insert(pattern.to_owned(), regex.clone());
+
+        Ok(regex)
+    }
 }
 
 #[derive(Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
@@ -121,5 +173,42 @@ mod tests {
         potato.0 = 43;
 
         assert_eq!(&Potato(43), config.get_custom::<Potato>().unwrap());
+    }
+
+    #[test]
+    fn regex_literals_are_compiled_per_config_by_default() {
+        let config = CompileConfig::default();
+
+        let first = config.compile_regex_literal("a+b").unwrap();
+        let second = config.compile_regex_literal("a+b").unwrap();
+
+        assert!(!Arc::ptr_eq(&first.into_inner(), &second.into_inner()));
+    }
+
+    #[test]
+    fn a_shared_cache_compiles_each_pattern_once() {
+        let cache = RegexCache::default();
+        let mut one = CompileConfig::default();
+        let mut two = CompileConfig::default();
+        one.set_regex_cache(Arc::clone(&cache));
+        two.set_regex_cache(Arc::clone(&cache));
+
+        let from_one = one.compile_regex_literal("a+b").unwrap().into_inner();
+        let from_two = two.compile_regex_literal("a+b").unwrap().into_inner();
+        let other = two.compile_regex_literal("c+d").unwrap().into_inner();
+
+        assert!(Arc::ptr_eq(&from_one, &from_two));
+        assert!(!Arc::ptr_eq(&from_two, &other));
+        assert_eq!(2, cache.lock().unwrap().len());
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_not_cached() {
+        let cache = RegexCache::default();
+        let mut config = CompileConfig::default();
+        config.set_regex_cache(Arc::clone(&cache));
+
+        assert!(config.compile_regex_literal("a(").is_err());
+        assert!(cache.lock().unwrap().is_empty());
     }
 }

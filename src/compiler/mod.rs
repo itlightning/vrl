@@ -25,7 +25,7 @@ pub(crate) use crate::diagnostic::Span;
 use crate::diagnostic::{DiagnosticList, DiagnosticMessage};
 use crate::parser::parse;
 
-pub use self::compile_config::CompileConfig;
+pub use self::compile_config::{CompileConfig, RegexCache};
 pub use self::deprecation_warning::DeprecationWarning;
 
 #[allow(clippy::module_inception)]

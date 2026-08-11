@@ -252,9 +252,11 @@ impl<'a> Compiler<'a> {
             Integer(v) => Ok(Literal::Integer(v)),
             Float(v) => Ok(Literal::Float(v)),
             Boolean(v) => Ok(Literal::Boolean(v)),
-            Regex(v) => regex::Regex::new(&v)
+            Regex(v) => self
+                .config
+                .compile_regex_literal(&v)
                 .map_err(|err| literal::Error::from((span, err)))
-                .map(|r| Literal::Regex(r.into())),
+                .map(Literal::Regex),
             // TODO: support more formats (similar to Vector's `Convert` logic)
             Timestamp(v) => v
                 .parse()
