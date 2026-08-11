@@ -24,7 +24,6 @@ pub(crate) struct Builder<'a> {
     arguments_with_unknown_type_validity: Vec<(Parameter, Node<FunctionArgument>)>,
     call_span: Span,
     ident_span: Span,
-    function_id: usize,
     arguments: Arc<Vec<Node<FunctionArgument>>>,
     closure: Option<(Vec<Ident>, closure::Input)>,
     list: ArgumentList,
@@ -56,11 +55,7 @@ impl<'a> Builder<'a> {
         let (ident_span, ident) = ident.take();
 
         // Check if function exists.
-        let Some((function_id, function)) = funcs
-            .iter()
-            .enumerate()
-            .find(|(_pos, f)| f.identifier() == ident.as_ref())
-        else {
+        let Some(function) = funcs.iter().find(|f| f.identifier() == ident.as_ref()) else {
             let idents = funcs
                 .iter()
                 .map(|func| func.identifier())
@@ -191,7 +186,6 @@ impl<'a> Builder<'a> {
             arguments_with_unknown_type_validity,
             call_span,
             ident_span,
-            function_id,
             arguments: Arc::new(arguments),
             closure,
             list,
@@ -404,8 +398,7 @@ impl<'a> Builder<'a> {
         local_snapshot: LocalEnv,
         config: &mut CompileConfig,
     ) -> Result<CallCompilationResult, FunctionCallError> {
-        let (closure, closure_fallible) =
-            self.compile_closure(closure_block, local_snapshot, state)?;
+        let closure_fallible = self.compile_closure(closure_block, local_snapshot, state)?;
 
         let call_span = self.call_span;
         let ident_span = self.ident_span;
@@ -481,12 +474,12 @@ impl<'a> Builder<'a> {
             function_call: FunctionCall {
                 abort_on_error: self.abort_on_error,
                 expr,
-                arguments_with_unknown_type_validity: self.arguments_with_unknown_type_validity,
+                has_arguments_with_unknown_type_validity: !self
+                    .arguments_with_unknown_type_validity
+                    .is_empty(),
                 closure_fallible,
-                closure,
                 span: call_span,
                 ident: self.function.identifier(),
-                function_id: self.function_id,
                 arguments: self.arguments.clone(),
                 warnings,
             },
@@ -499,7 +492,7 @@ impl<'a> Builder<'a> {
         closure_block: Option<Node<(Block, TypeDef)>>,
         mut locals: LocalEnv,
         state: &mut TypeState,
-    ) -> Result<(Option<Closure>, bool), FunctionCallError> {
+    ) -> Result<bool, FunctionCallError> {
         // Check if we have a closure we need to compile.
         if let Some((variables, input)) = self.closure.clone() {
             // TODO: This assumes the closure will run exactly once, which is incorrect.
@@ -537,13 +530,12 @@ impl<'a> Builder<'a> {
                 });
             }
 
-            let fnclosure = Closure::new(variables, block, block_type_def);
-            self.list.set_closure(fnclosure.clone());
+            self.list
+                .set_closure(Closure::new(variables, block, block_type_def));
 
-            // closure = Some(fnclosure);
-            Ok((Some(fnclosure), closure_fallible))
+            Ok(closure_fallible)
         } else {
-            Ok((None, false))
+            Ok(false)
         }
     }
 }
@@ -552,11 +544,12 @@ impl<'a> Builder<'a> {
 pub struct FunctionCall {
     abort_on_error: bool,
     expr: Box<dyn Expression>,
-    arguments_with_unknown_type_validity: Vec<(Parameter, Node<FunctionArgument>)>,
+    /// Whether any argument only partially matched its parameter's type. Read by
+    /// `type_info` to mark the call fallible. The compiler consumes the arguments
+    /// themselves (for the `InvalidArgumentKind` diagnostic) before this is built,
+    /// so only the flag has to survive compilation.
+    has_arguments_with_unknown_type_validity: bool,
     closure_fallible: bool,
-    // will be used with: https://github.com/vectordotdev/vector/issues/13782
-    #[allow(dead_code)]
-    closure: Option<Closure>,
 
     // used for enhancing runtime error messages (using abort-instruction).
     //
@@ -566,9 +559,6 @@ pub struct FunctionCall {
     // used for equality check
     pub(crate) ident: &'static str,
 
-    // May be used by the LLVM runtime. If not, it should be removed
-    #[allow(dead_code)]
-    function_id: usize,
     arguments: Arc<Vec<Node<FunctionArgument>>>,
 
     pub(crate) warnings: Vec<Warning>,
@@ -757,7 +747,7 @@ impl Expression for FunctionCall {
         // For the third event, both functions fail.
         //
 
-        if !self.arguments_with_unknown_type_validity.is_empty() {
+        if self.has_arguments_with_unknown_type_validity {
             expr_result = expr_result.fallible();
         }
 
